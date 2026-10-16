@@ -41,7 +41,7 @@ DEFAULTS = {"use_demo": True, "dry_run": True, "api_key_id": "",
             "risk": "balanced", "trade_other": False,
             "bet_style": "parlay", "parlay_legs": 3, "leg_min_prob": 90.0, "parlay_min_prob": 80.0,
             "update_url": ""}
-VERSION = "4.0"
+VERSION = "4.1"
 
 # Kalshi series ticker -> (ESPN scoreboard path, league name)
 SERIES = {
@@ -269,11 +269,30 @@ def headers(method, path):
             "Content-Type": "application/json"}
 
 
+_RL = {"t": 0.0}
+_RLL = threading.Lock()
+
+
 def api(method, path, body=None):
-    r = requests.request(method, BASE + path, headers=headers(method, path) if PRIVATE_KEY else {"Content-Type": "application/json"},
-                         data=json.dumps(body) if body else None, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    """Kalshi call. Reads are spaced out and retried when Kalshi says 'too many requests' (429)."""
+    for attempt in range(4):
+        if method == "GET":
+            with _RLL:                                   # at most ~8 reads per second
+                wait = _RL["t"] + 0.12 - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                _RL["t"] = time.time()
+        r = requests.request(method, BASE + path, headers=headers(method, path) if PRIVATE_KEY else {"Content-Type": "application/json"},
+                             data=json.dumps(body) if body else None, timeout=15)
+        if r.status_code == 429 and method == "GET" and attempt < 3:
+            try:
+                delay = float(r.headers.get("Retry-After") or 0)
+            except ValueError:
+                delay = 0
+            time.sleep(min(10.0, delay or 1.5 * (attempt + 1)))
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 def cents(m, field):
@@ -1250,6 +1269,7 @@ def build_parlays(pool, cash, mode):
     return f"{built} parlay(s) built" + (f"; {note}" if note else "")
 
 
+EMPTY = {}
 OTHER = {"ts": 0.0, "markets": []}
 
 
@@ -1374,6 +1394,8 @@ def tick():
 
     cache = {}
     for series in want:
+        if EMPTY.get(series, 0) > time.time():
+            continue                                     # had no open markets a moment ago; look again later
         espn_path, league = all_series[series]
         games = None
         if league not in CRYPTO_LEAGUES:
@@ -1388,6 +1410,7 @@ def tick():
             continue
         if not markets:
             empty.append(series)
+            EMPTY[series] = time.time() + 600
         for m in markets:
             process(m, series, league, games)
     if "OTHER" in CFG["leagues"]:
@@ -1580,15 +1603,17 @@ function position(mode){
 }
 function report(){
  const r=S.report,box=$('report');
- if(!r){box.rc(h('h2',0,'What the bot sees'),h('div',{class:'mut'},'Waiting for the first scan…'));return}
- const rows=Object.entries(r.leagues).filter(([k,v])=>v.loaded>0),sum=k=>rows.reduce((a,[,v])=>a+v[k],0);
- box.rc(h('h2',0,'What the bot sees',h('span',{class:'mut'},'Last scan '+r.ts)),
-  h('div',{style:'margin-bottom:10px'},sum('loaded')+' markets loaded · ',h('b',0,sum('in_range')),' in your price range ('+C.min_price+'–'+C.max_price+'%) · ',h('b',0,sum('in_time')),' within the time limit · ',h('b',0,sum('passed')),' passed the live check · ',h('b',0,sum('bought')),' bought'),
-  rows.length?h('div',{style:'overflow-x:auto'},h('table',0,h('tr',0,['Market type','Loaded','In price range','In time limit','Passed live check','Bought'].map(x=>h('th',0,x))),rows.map(([k,v])=>h('tr',0,h('td',0,LN[k]||k),h('td',0,v.loaded),h('td',0,v.in_range),h('td',0,v.in_time),h('td',0,v.passed),h('td',0,v.bought))))):h('div',{class:'mut'},'Kalshi returned no markets. Check your internet connection.'),
-  r.reasons.length?[h('div',{class:'mut',style:'margin:12px 0 4px'},'Why markets in your price range were not bought:'),h('ul',{style:'margin:0;padding-left:18px'},r.reasons.map(([t,n])=>h('li',0,n+' × '+t)))]:null,
-  r.parlay&&r.parlay.style==='parlay'?h('div',{style:'margin-top:10px'},h('b',0,'Parlay builder: '),r.parlay.legs+' leg'+(r.parlay.legs==1?'':'s')+' qualify'+(r.parlay.note?' · '+r.parlay.note:S.running?'':' · press Start to build parlays')):null,
-  r.empty.length?h('div',{class:'mut',style:'margin-top:10px'},'No open markets right now in: '+r.empty.join(', ')):null,
-  r.errors.length?h('div',{style:'margin-top:10px;color:var(--bad)'},'Problems: '+r.errors.join(' | ')):null);
+ if(!r){box.rc(h('h2',0,'Status'),h('div',{class:'mut'},'Starting up…'));return}
+ const rows=Object.entries(r.leagues).filter(([k,v])=>v.loaded>0),sum=k=>rows.reduce((a,[,v])=>a+v[k],0),p=r.parlay;
+ const line=!S.running?'The bot is stopped. Press Start and it will look for parlays by itself.'
+  :(p&&p.style==='parlay')?(p.legs>=2?'Building parlays from the strongest bets it found…':'Watching the markets. It builds a parlay as soon as enough very likely bets line up.')
+  :'Watching the markets for very likely single bets.';
+ box.rc(h('h2',0,'Status',h('span',{class:'mut'},'Last check '+r.ts)),h('div',0,line),
+  h('details',{style:'margin-top:12px'},h('summary',{class:'mut',style:'cursor:pointer'},'Technical details (only for troubleshooting)'),
+   h('div',{style:'margin:10px 0'},sum('loaded')+' markets loaded · '+sum('in_range')+' in your price range · '+sum('in_time')+' within the time limit · '+sum('passed')+' passed the checks · '+sum('bought')+' bought singly'+(p&&p.style==='parlay'?' · '+p.legs+' parlay legs ready'+(p.note?' ('+p.note+')':''):'')),
+   rows.length?h('div',{style:'overflow-x:auto'},h('table',0,h('tr',0,['Market type','Loaded','In price range','In time limit','Passed checks','Bought'].map(x=>h('th',0,x))),rows.map(([k,v])=>h('tr',0,h('td',0,LN[k]||k),h('td',0,v.loaded),h('td',0,v.in_range),h('td',0,v.in_time),h('td',0,v.passed),h('td',0,v.bought))))):h('div',{class:'mut'},'Kalshi returned no markets. Check your internet connection.'),
+   r.reasons.length?[h('div',{class:'mut',style:'margin:12px 0 4px'},'Why markets were skipped:'),h('ul',{style:'margin:0;padding-left:18px'},r.reasons.map(([t,n])=>h('li',0,n+' × '+t)))]:null,
+   r.errors.length?h('div',{style:'margin-top:10px;color:var(--bad)'},'Problems: '+r.errors.join(' | ')):null));
 }
 function orders(mode){
  const o=S.orders.filter(x=>x.mode===mode).sort((a,b)=>b.ts-a.ts),hold=o.filter(x=>x.status==='HOLDING').length;
@@ -1599,7 +1624,7 @@ function orders(mode){
 }
 function decisions(){
  const pills=['All','Signal fired','Stop-loss','Blocked','Waiting'].map(k=>h('button',{class:'pill'+(filt===k?' ok':''),on:{click:()=>{filt=k;render()}}},k));
- const rows=S.decisions.filter(d=>filt==='All'||d.kind===filt).slice(0,40);
+ const rows=S.decisions.filter(d=>filt==='All'?(d.kind!=='Waiting'&&d.kind!=='Blocked'):d.kind===filt).slice(0,40);
  $('decisions').rc(h('h2',0,'Activity'),
   h('div',{style:'display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;align-items:center'},pills,h('span',{class:'mut'},S.decisions.length+' recorded')),
   rows.length?h('div',{class:'dec'},rows.map(d=>h('div',{class:'drow '+d.kind.split(' ')[0]},h('span',{class:'k'},h('i'),d.kind),h('span',0,d.msg),h('span',{class:'mut'},tm(d.ts))))):h('div',{class:'mut'},'Nothing recorded yet.'));
