@@ -12,7 +12,7 @@ Install:  pip install requests cryptography
 Defaults are SAFE: demo environment + DRY_RUN=True.
 """
 import ast, base64, json, math, os, re, sys, threading, time, uuid, webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -40,8 +40,9 @@ DEFAULTS = {"use_demo": True, "dry_run": True, "api_key_id": "",
             "view_hours": 24.0, "stop_loss_on": True, "stop_loss_pct": 60.0,
             "risk": "balanced", "trade_other": False,
             "bet_style": "parlay", "parlay_legs": 3, "leg_min_prob": 90.0, "parlay_min_prob": 80.0,
-            "update_url": ""}
-VERSION = "4.1"
+            "update_url": "", "future_parlays": True, "future_hours": 24.0,
+            "future_leg_min": 75.0, "future_parlay_min": 50.0}
+VERSION = "4.4"
 
 # Kalshi series ticker -> (ESPN scoreboard path, league name)
 SERIES = {
@@ -123,6 +124,9 @@ def load_config():
             CFG.update({k: v for k, v in saved.items() if k in DEFAULTS})
             CFG["min_leads"] = {k: v for k, v in {**DEFAULTS["min_leads"], **CFG["min_leads"]}.items()
                                 if k in DEFAULTS["min_leads"]}
+            CFG["future_hours"] = min(24.0, CFG["future_hours"])     # everything settles within a day
+            if CFG["future_leg_min"] == 70.0 and CFG["future_parlay_min"] == 45.0:   # old defaults -> stricter ones
+                CFG["future_leg_min"], CFG["future_parlay_min"] = 75.0, 50.0
             if "risk" not in saved:        # upgrading from an older version
                 CFG["leagues"] = list(CFG["leagues"]) + [x for x in LEAGUES if x not in CFG["leagues"]]
                 if CFG["max_price"] == 95:
@@ -191,6 +195,8 @@ def update_config(new):
         return "need 1 <= min price <= max price <= 99"
     if not (2 <= m["parlay_legs"] <= 5) or not (50 <= m["leg_min_prob"] <= 99) or not (30 <= m["parlay_min_prob"] <= 99):
         return "parlay: 2 to 5 legs, each leg at least 50% and the whole parlay at least 30% (both at most 99%)"
+    if not (1 <= m["future_hours"] <= 24) or not (50 <= m["future_leg_min"] <= 95) or not (20 <= m["future_parlay_min"] <= 95):
+        return "future parlays: look ahead 1 to 24 hours, each leg 50 to 95%, whole parlay 20 to 95%"
     if not (1 <= m["stop_loss_pct"] <= 99):
         return "stop-loss must be between 1 and 99 percent"
     if m["stake_usd"] <= 0 or m["paper_bankroll"] <= 0 or m["btc_min_sigma"] <= 0 or m["btc_max_minutes"] < 1 or m["m15_max_minutes"] < 1 or m["view_hours"] < 1 or m["max_minutes_to_close"] < 1 or m["max_open_bets"] < 1 or m["poll_seconds"] < 10:
@@ -338,11 +344,34 @@ def norm(a):
     return ALIAS.get(a.upper(), a.upper())
 
 
+def _espn_events(path):
+    """Scoreboard events for today and tomorrow (US Eastern dates), so upcoming games are known too."""
+    et = datetime.now(timezone.utc) - timedelta(hours=5)
+    out, seen = [], set()
+    for i, d in enumerate(((et + timedelta(days=k)).strftime("%Y%m%d") for k in (0, 1))):
+        url = f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard?dates={d}"
+        try:
+            evs = requests.get(url, timeout=10).json().get("events", [])
+        except Exception:
+            if i == 0:
+                raise
+            continue
+        for ev in evs:
+            if ev.get("id") not in seen:
+                seen.add(ev.get("id"))
+                out.append(ev)
+    return out
+
+
+def _start_ts(ev):
+    t = _t(ev.get("date"))
+    return t.timestamp() if t else None
+
+
 def live_games(path):
-    """Returns {team_abbr: {state, period, clock_s, lead}} for today's games."""
-    url = f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard"
+    """Returns {team_abbr: {state, period, clock_s, lead, start, ...}} for today's and tomorrow's games."""
     out = {}
-    for ev in requests.get(url, timeout=10).json().get("events", []):
+    for ev in _espn_events(path):
         st = ev["status"]
         comps = ev["competitions"][0]["competitors"]
         if len(comps) != 2:
@@ -352,7 +381,11 @@ def live_games(path):
         except Exception:
             continue
         for i, c in enumerate(comps):
-            out[norm(c["team"]["abbreviation"])] = {
+            key = norm(c["team"]["abbreviation"])
+            if key in out and out[key]["state"] != "post":
+                continue                      # a team plays at most one unfinished game here: keep the earlier one
+            out[key] = {
+                "start": _start_ts(ev),
                 "state": st["type"]["state"],  # pre / in / post
                 "period": st.get("period", 0),
                 "clock_s": st.get("clock", 0),
@@ -471,7 +504,7 @@ def soccer_games(path):
     """List of per-team entries for today's soccer matches (ESPN)."""
     url = f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard"
     out = []
-    for ev in requests.get(url, timeout=10).json().get("events", []):
+    for ev in _espn_events(path):
         st = ev["status"]
         comps = ev["competitions"][0]["competitors"]
         if len(comps) != 2:
@@ -488,7 +521,7 @@ def soccer_games(path):
                         "period": st.get("period", 0), "clock_s": st.get("clock", 0),
                         "clock": st.get("displayClock", ""), "minute": _clock_min(st),
                         "lead": scores[i] - scores[1 - i], "label": ev.get("shortName", ""),
-                        "total": sum(scores)})
+                        "total": sum(scores), "start": _start_ts(ev)})
     return out
 
 
@@ -717,6 +750,7 @@ def parse_standings(data, league, soccer):
         if pd is None and pf is not None and pa is not None:
             pd = pf - pa
         diff = pd / gp if pd is not None else (wp - 0.5) * (2.0 if soccer else WP_SCALE.get(league, 10))
+        diff *= gp / (gp + 10.0)             # few games played -> trust the numbers less
         rating = {"gp": gp, "wp": wp, "diff": diff,
                   "tot": (pf + pa) / gp if pf is not None and pa is not None else None}
         t = e["team"]
@@ -787,14 +821,14 @@ def win_prob(league, g, r_self, r_opp):
             return None
         la, lb = f * max(0.15, 1.35 + mu / 2), f * max(0.15, 1.35 - mu / 2)
         p = sum(_pois(x, la) * _pois(y, lb) for x in range(11) for y in range(11) if g["lead"] + x - y > 0)
-        return min(p, 0.995)
+        return min(p, 0.9 if g["state"] == "pre" else 0.995)
     if league not in SD_MARGIN:
         return None
     f = frac_left(league, g)
     if f is None:
         return None
     f = max(f, 0.004)
-    return min(phi((g["lead"] + mu * f) / (SD_MARGIN[league] * math.sqrt(f))), 0.995)
+    return min(phi((g["lead"] + mu * f) / (SD_MARGIN[league] * math.sqrt(f))), 0.9 if g["state"] == "pre" else 0.995)
 
 
 def total_line(m):
@@ -866,6 +900,19 @@ def total_prob(league, g, line, prior):
     return max(0.0, min(0.995, 1 - phi((line - mean_final) / (SD_TOTAL[league] * math.sqrt(f)))))
 
 
+def strong_pick(a):
+    """Quality gate for upcoming-game legs: both teams must be known and have played enough, a winner must be a
+    clearly better team (record AND scoring), a totals leg needs scoring numbers for both teams."""
+    rs, ro = a.get("rs"), a.get("ro")
+    if not rs or not ro:
+        return False
+    if rs["gp"] < 5 or ro["gp"] < 5:
+        return False
+    if a.get("is_total"):
+        return bool(rs.get("tot") and ro.get("tot"))
+    return rs["wp"] >= 0.55 and rs["wp"] - ro["wp"] >= 0.15 and rs["diff"] > ro["diff"]
+
+
 def assess_total(league, m, games, series, path):
     ask = cents(m, "yes_ask")
     bad = lambda why: {"ok": False, "why": why, "model": None, "p": None, "live": False, "behind": False,
@@ -893,7 +940,8 @@ def assess_total(league, m, games, series, path):
     elif ask is not None and ask > p * 100:
         ok, why = False, f"model only {p:.0%} but the price is {ask}¢, not worth paying"
     return {"ok": ok, "why": why, "model": round(p * 100), "p": p, "live": g["state"] == "in",
-            "behind": False, "info": info, "gid": gid, "line": line, "unit": unit}
+            "behind": False, "info": info, "gid": gid, "line": line, "unit": unit,
+            "pregame": g["state"] == "pre", "start": g.get("start"), "rs": ra, "ro": rb, "is_total": True}
 
 
 def assess(league, m, games, spots, series):
@@ -925,17 +973,20 @@ def assess(league, m, games, spots, series):
     else:
         ok, why = verify(league, game)
     live = bool(game and game["state"] == "in")
-    p = None
+    p, rs, ro = None, None, None
     if game is not None and league != "TENNIS":
         try:
             pool = list(games.values()) if isinstance(games, dict) else games
             opp = next((x for x in pool if x.get("gid") == game.get("gid") and x is not game), None)
-            p = win_prob(league, game, team_rating(path, league, game), team_rating(path, league, opp))
+            rs, ro = team_rating(path, league, game), team_rating(path, league, opp)
+            p = win_prob(league, game, rs, ro)
         except Exception as e:
             warn_once(f"win model failed: {e}")
     return {"ok": ok, "why": why, "model": round(p * 100) if p is not None else None, "p": p, "live": live,
             "behind": bool(live and game["lead"] < 0), "info": game_info(league, game),
-            "gid": f"{league}:{game['gid']}" if game is not None else m.get("event_ticker")}
+            "gid": f"{league}:{game['gid']}" if game is not None else m.get("event_ticker"),
+            "pregame": bool(game and game["state"] == "pre"), "start": game.get("start") if game else None,
+            "rs": rs, "ro": ro, "is_total": False}
 
 
 def rate(ask, a):
@@ -1215,7 +1266,9 @@ def place_parlay(legs, price, count, comb):
                        "title": " + ".join(names), "name": f"Parlay of {len(legs)}", "league": "PARLAY",
                        "side": "YES", "count": count, "price": price, "mode": mode_name(),
                        "close_ts": max(closes) if None not in closes else None,
-                       "legs": [{"ticker": x["ticker"], "name": x["name"], "league": x["league"],
+                       "future": any(x.get("future") for x in legs),
+                       "legs": [{"ticker": x["ticker"], "name": x["name"], "league": x["league"], "gid": x["gid"],
+                                 "title": x.get("title", ""), "outcome": x.get("outcome") or x["name"], "start": x.get("start"),
                                  "ask": x["ask"], "p": round(x["p"], 3), "bid": x["bid"], "result": None} for x in legs],
                        "status": "HOLDING", "pnl": None, "closed_ts": None, "bid": None})
         _save(ORDERS_FILE, ORDERS)
@@ -1235,38 +1288,46 @@ def build_parlays(pool, cash, mode):
                "verified here). Set Bet style to 'Single bets' to trade live.")
         return "parlays are practice-only; switch Bet style to single bets for live trading"
     used = used_tickers(mode)
-    best = {}
-    for x in sorted(pool, key=lambda x: -x["p"]):
-        if x["ticker"] not in used:
-            best.setdefault(x["gid"], x)
-    legs = sorted(best.values(), key=lambda x: -x["p"])
-    built, note = 0, ""
-    while open_count(mode) < CFG["max_open_bets"] and len(legs) >= 2:
-        pick = None
-        for n in range(min(CFG["parlay_legs"], len(legs)), 1, -1):
-            if math.prod(x["p"] for x in legs[:n]) * 100 >= CFG["parlay_min_prob"]:
-                pick = legs[:n]
+    busy = {l.get("gid") for o in ORDERS if o["mode"] == mode and o["status"] == "HOLDING" and o.get("kind") == "parlay"
+            for l in o.get("legs", [])}
+    notes, total = [], 0
+    for future, min_prob in ((False, CFG["parlay_min_prob"]), (True, CFG["future_parlay_min"])):
+        best = {}
+        for x in sorted(pool, key=lambda x: -x["p"]):
+            if bool(x.get("future")) == future and x["ticker"] not in used and x["gid"] not in busy:
+                best.setdefault(x["gid"], x)
+        legs = sorted(best.values(), key=lambda x: -x["p"])
+        built, note = 0, ""
+        while open_count(mode) < CFG["max_open_bets"] and len(legs) >= 2:
+            pick = None
+            for n in range(min(CFG["parlay_legs"], len(legs)), 1, -1):
+                if math.prod(x["p"] for x in legs[:n]) * 100 >= min_prob:
+                    pick = legs[:n]
+                    break
+            if pick is None:
+                note = (f"best 2-leg {'upcoming ' if future else ''}combo is only "
+                        f"{math.prod(x['p'] for x in legs[:2]):.0%}, you require {min_prob:g}%")
                 break
-        if pick is None:
-            note = (f"best 2-leg combo is only {math.prod(x['p'] for x in legs[:2]):.0%}, "
-                    f"you require {CFG['parlay_min_prob']:g}%")
-            break
-        price = round(100 * math.prod(x["ask"] / 100 for x in pick), 2)
-        count = int(CFG["stake_usd"] * 100 // price)
-        if count < 1:
-            note = f"stake ${CFG['stake_usd']:.2f} too small for a {price:g}\u00a2 parlay"
-            break
-        if count * price > cash:
-            note = "not enough cash"
-            break
-        place_parlay(pick, price, count, math.prod(x["p"] for x in pick))
-        cash -= count * price
-        built += 1
-        ids = {id(x) for x in pick}
-        legs = [x for x in legs if id(x) not in ids]
-    if built == 0 and not note:
-        note = "max open bets reached" if open_count(mode) >= CFG["max_open_bets"] else "not enough different games for a parlay"
-    return f"{built} parlay(s) built" + (f"; {note}" if note else "")
+            price = round(100 * math.prod(x["ask"] / 100 for x in pick), 2)
+            count = int(CFG["stake_usd"] * 100 // price)
+            if count < 1:
+                note = f"stake ${CFG['stake_usd']:.2f} too small for a {price:g}\u00a2 parlay"
+                break
+            if count * price > cash:
+                note = "not enough cash"
+                break
+            place_parlay(pick, price, count, math.prod(x["p"] for x in pick))
+            cash -= count * price
+            built += 1
+            ids = {id(x) for x in pick}
+            busy.update(x["gid"] for x in pick)
+            legs = [x for x in legs if id(x) not in ids]
+        total += built
+        if note:
+            notes.append(note)
+    if total == 0 and not notes:
+        notes.append("max open bets reached" if open_count(mode) >= CFG["max_open_bets"] else "not enough different games for a parlay")
+    return f"{total} parlay(s) built" + (f"; {'; '.join(notes)}" if notes else "")
 
 
 EMPTY = {}
@@ -1331,6 +1392,25 @@ def tick():
                          "mins": max(0, round(mins)) if mins is not None else None,
                          "live": a["live"], "info": a["info"], "model": a["model"],
                          "level": level, "note": note})
+        if (CFG["bet_style"] == "parlay" and CFG["future_parlays"] and a.get("pregame") and a.get("p") is not None
+                and a.get("start") and 0 < a["start"] - time.time() <= CFG["future_hours"] * 3600):
+            # An upcoming game (today or tomorrow): its own, lower bar based on team strength.
+            lp = a["p"]
+            if not strong_pick(a):
+                r_ = reasons.setdefault("weak", [0, "upcoming games skipped: teams not clearly strong enough, or too little data"])
+                r_[0] += 1
+                return
+            if (STATE["running"] and t not in used and ask is not None and 50 <= ask <= 95
+                    and (mins is None or mins <= CFG["future_hours"] * 60 + 300)
+                    and lp * 100 >= CFG["future_leg_min"] and ask <= lp * 100 + 3
+                    and bid is not None and ask - bid <= 8):
+                f["passed"] += 1
+                pool.append({"ticker": t, "name": name, "league": league, "ask": ask, "bid": bid, "p": lp,
+                             "gid": a.get("gid") or t, "why": f"upcoming game, strength model {lp:.0%}",
+                             "future": True, "start": a["start"], "title": m.get("title", ""),
+                             "outcome": m.get("yes_sub_title") or name,
+                             "close_ts": (time.time() + mins * 60) if mins is not None else None})
+            return
         if not in_range:
             return
         f["in_range"] += 1
@@ -1368,7 +1448,8 @@ def tick():
                 r_[0] += 1
             else:
                 pool.append({"ticker": t, "name": name, "league": league, "ask": ask, "bid": bid, "p": lp,
-                             "gid": a.get("gid") or t, "why": a["why"],
+                             "gid": a.get("gid") or t, "why": a["why"], "future": False, "start": None,
+                             "title": m.get("title", ""), "outcome": m.get("yes_sub_title") or name,
                              "close_ts": (time.time() + mins * 60) if mins is not None else None})
             return
         count, block = int(CFG["stake_usd"] * 100 // ask), None
@@ -1509,6 +1590,13 @@ button.big.go{background:var(--acc)}button.big.stop{background:var(--bad)}
 #setup{padding:10px 20px;background:var(--badbg);color:var(--bad);font-weight:600}
 dialog{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--fg);width:min(560px,94vw);max-height:88vh}
 @media(max-width:820px){nav{display:none}.chips .env{display:none}}
+.pcard{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:0 0 12px;background:var(--panel)}
+.phead{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.pstats{display:flex;gap:18px;flex-wrap:wrap}
+.grp{font-size:11px;letter-spacing:.08em;color:var(--mut);margin:14px 0 2px;text-transform:uppercase;font-weight:600}
+.lt{font-weight:700;font-size:15px;margin-top:10px}
+.lo{display:flex;justify-content:space-between;gap:12px;border-left:2px solid var(--line);margin:6px 0 2px 6px;padding-left:16px}
+.lo span:last-child{color:var(--mut)}.lo .pos{color:var(--acc);font-weight:600}.lo .neg{color:var(--bad);font-weight:600}
 </style></head><body>
 <header><div class="brand"><svg width="26" height="26" viewBox="0 0 24 24"><path fill="#e8590c" d="M12 2c1 4 6 6 6 11a6 6 0 0 1-12 0c0-2 1-4 2-5 0 2 1 3 2 3 0-4-1-6 2-9z"/><path fill="#ffb454" d="M12 12c1 2 3 3 3 5a3 3 0 0 1-6 0c0-1 .5-2 1-2.500 0 1 1 1.500 1 1.500 0-2-.5-2.500 1-4z"/></svg>Inferno</div>
 <div class="chips"><div class="chip"><div><span>CASH</span><b id="cash">-</b></div><div><span>PORTFOLIO</span><b id="port">-</b></div></div><div class="env" id="env">-</div></div></header>
@@ -1564,19 +1652,20 @@ function quickInit(){
  const qmsg=h('span',{class:'mut'}),dirty=()=>{qdirty=true;qmsg.textContent=''};
  const mk=step=>{const i=h('input',{type:'number',step:step||'any',min:'0'});i.oninput=dirty;return i};
  const minp=mk('1'),maxp=mk('1'),mins=mk('1'),m15=mk('0.5'),stake=mk(),maxb=mk('1'),slp=mk('1');
- const style=h('select'),legsN=mk('1'),legp=mk('1'),parp=mk('1');
+ const style=h('select'),legsN=mk('1'),legp=mk('1'),parp=mk('1'),futon=h('input',{type:'checkbox'}),futh=mk('1'),futl=mk('1'),futp=mk('1');futon.onchange=dirty;
  [['parlay','Parlays (automatic)'],['single','Single bets']].forEach(([v,l])=>style.append(h('option',{value:v},l)));style.onchange=dirty;
  const slon=h('input',{type:'checkbox'}),oth=h('input',{type:'checkbox'}),risk=h('select'),hint=h('div',{class:'mut',style:'margin-top:4px'});
  [['safe','Safe'],['balanced','Balanced (recommended)'],['aggressive','Aggressive']].forEach(([v,l])=>risk.append(h('option',{value:v},l)));
  const upd=()=>{hint.textContent='Soccer: '+SOC[risk.value]+'. Tennis: '+TEN[risk.value]+'.'};
  risk.onchange=()=>{dirty();upd()};slon.onchange=dirty;oth.onchange=dirty;
- Q={minp,maxp,mins,m15,stake,maxb,slp,slon,oth,risk,qmsg,upd,style,legsN,legp,parp};
+ Q={minp,maxp,mins,m15,stake,maxb,slp,slon,oth,risk,qmsg,upd,style,legsN,legp,parp,futon,futh,futl,futp};
  const f=(l,el)=>h('div',{class:'field'},h('label',0,l),el);
  $('quick').rc(h('h2',0,'Your settings'),
   h('div',{class:'qgrid'},
    f('Only buy when the market’s chance is at least (%)',minp),f('…and at most (%)',maxp),
    f('Only markets with at most this many minutes left',mins),f('15-minute markets: only bet in the last (minutes)',m15),
-   h('div',{class:'field'},h('label',0,'Bet style'),style),f('Parlay: most legs',legsN),f('Each leg must be at least this likely (%)',legp),f('Whole parlay must be at least this likely (%)',parp),
+   h('div',{class:'field'},h('label',0,'Bet style'),style),f('Parlay: most legs',legsN),
+   h('div',{class:'field',style:'grid-column:1/-1'},h('label',{style:'display:flex;gap:6px;align-items:center'},futon,'Also build parlays for games that start soon (today or tomorrow)')),f('Look ahead (hours)',futh),f('Upcoming game: each leg at least (%)',futl),f('Upcoming game: whole parlay at least (%)',futp),f('Each leg must be at least this likely (%)',legp),f('Whole parlay must be at least this likely (%)',parp),
    h('div',{class:'field'},h('label',0,'Soccer & tennis: how obvious must the win be?'),risk,hint),
    f('Bet size per trade ($)',stake),f('Max bets at once',maxb),
    h('div',{class:'field'},h('label',{style:'display:flex;gap:6px;align-items:center'},slon,'Stop-loss: automatically sell a bet if it is down'),h('div',{style:'display:flex;gap:6px;align-items:center'},slp,h('span',0,'%'))),
@@ -1585,20 +1674,31 @@ function quickInit(){
 }
 function syncQuick(){if(!Q)quickInit();if(qdirty)return;
  Q.minp.value=C.min_price;Q.maxp.value=C.max_price;Q.mins.value=C.max_minutes_to_close;Q.m15.value=C.m15_max_minutes;Q.risk.value=C.risk;Q.upd();
- Q.stake.value=C.stake_usd;Q.maxb.value=C.max_open_bets;Q.slp.value=C.stop_loss_pct;Q.slon.checked=C.stop_loss_on;Q.oth.checked=C.trade_other;Q.style.value=C.bet_style;Q.legsN.value=C.parlay_legs;Q.legp.value=C.leg_min_prob;Q.parp.value=C.parlay_min_prob}
+ Q.stake.value=C.stake_usd;Q.maxb.value=C.max_open_bets;Q.slp.value=C.stop_loss_pct;Q.slon.checked=C.stop_loss_on;Q.oth.checked=C.trade_other;Q.style.value=C.bet_style;Q.legsN.value=C.parlay_legs;Q.legp.value=C.leg_min_prob;Q.parp.value=C.parlay_min_prob;Q.futon.checked=C.future_parlays;Q.futh.value=C.future_hours;Q.futl.value=C.future_leg_min;Q.futp.value=C.future_parlay_min}
 async function saveQuick(){
  const r=await post('/api/config',{min_price:Number(Q.minp.value),max_price:Number(Q.maxp.value),max_minutes_to_close:Number(Q.mins.value),m15_max_minutes:Number(Q.m15.value),risk:Q.risk.value,
-  stake_usd:Number(Q.stake.value),max_open_bets:Number(Q.maxb.value),stop_loss_on:Q.slon.checked,stop_loss_pct:Number(Q.slp.value),trade_other:Q.oth.checked,bet_style:Q.style.value,parlay_legs:Number(Q.legsN.value),leg_min_prob:Number(Q.legp.value),parlay_min_prob:Number(Q.parp.value)});
+  stake_usd:Number(Q.stake.value),max_open_bets:Number(Q.maxb.value),stop_loss_on:Q.slon.checked,stop_loss_pct:Number(Q.slp.value),trade_other:Q.oth.checked,bet_style:Q.style.value,parlay_legs:Number(Q.legsN.value),leg_min_prob:Number(Q.legp.value),parlay_min_prob:Number(Q.parp.value),future_parlays:Q.futon.checked,future_hours:Number(Q.futh.value),future_leg_min:Number(Q.futl.value),future_parlay_min:Number(Q.futp.value)});
  if(r.ok){qdirty=false;Q.qmsg.textContent='Saved.'}else Q.qmsg.textContent=await r.text();refresh()}
+function legCard(o){
+ const legs=o.legs||[{league:o.league,title:o.title||o.ticker,outcome:o.name||o.title,ask:o.price,bid:o.bid,result:null}];
+ const groups={};legs.forEach(l=>{(groups[l.league]=groups[l.league]||[]).push(l)});
+ const starts=x=>x.start&&x.start*1000>Date.now()?' · starts in '+closes(Math.round((x.start*1000-Date.now())/60000)):'';
+ return Object.entries(groups).map(([lg,ls])=>[h('div',{class:'grp'},(LN[lg]||lg)),
+  ls.map(l=>[h('div',{class:'lt'},l.title||l.name),h('div',{class:'lo'},h('span',0,(l.outcome||l.name)+starts(l)),
+   h('span',{class:l.result==='yes'?'pos':l.result==='no'?'neg':''},l.result?(l.result==='yes'?'Won':'Lost'):(Math.round(l.bid!=null&&l.bid>0?l.bid:l.ask)+'%')))])]);
+}
 function position(mode){
  const o=S.orders.filter(x=>x.mode===mode&&x.status==='HOLDING').sort((a,b)=>b.ts-a.ts);
  const cost=o.reduce((a,x)=>a+x.count*x.price,0),val=o.reduce((a,x)=>a+(x.value??x.count*x.price),0);
  const left=x=>x.close_ts?closes(Math.max(0,Math.round((x.close_ts*1000-Date.now())/60000))):'-';
  const sl=x=>C.stop_loss_on?Math.floor(x.price*(1-C.stop_loss_pct/100)+1e-9)+'¢':'off';
+ const mini=(l,v,c)=>h('div',0,h('div',{class:'mut',style:'font-size:11px'},l),h('b',{class:c||''},v));
  $('position').rc(h('h2',0,'Current positions',h('span',{class:'mut'},(mode==='paper'?'Practice · simulated bets the bot made':'Live bets the bot made')+' · '+o.length+' open')),
   o.length?[h('div',{class:'stats',style:'margin:0 0 10px'},st('Cost',usd(cost)),st('Value now',usd(val)),st('Unrealized P&L',h('b',{class:cls(val-cost)},sgn(val-cost)))),
-   h('div',{style:'overflow-x:auto'},h('table',0,h('tr',0,['Bet','Qty','Bought at','Now','Value','P&L','Closes in','Stop-loss at'].map(x=>h('th',0,x))),o.map(x=>h('tr',0,
-    h('td',0,h('b',0,x.name||x.title),x.legs?x.legs.map(l=>h('div',{class:'mut'},'• '+(LN[l.league]||l.league)+' '+l.name+' @'+l.ask+'¢'+(l.result?(' → '+l.result.toUpperCase()):''))):h('div',{class:'mut'},(LN[x.league]||x.league)+' · '+(x.title||x.ticker))),h('td',0,'×'+x.count+' YES'),h('td',0,x.price+'¢'),h('td',0,x.bid==null?'-':x.bid+'¢'),h('td',0,usd(x.value??x.count*x.price)),h('td',{class:cls(x.unreal||0)},sgn(x.unreal||0)),h('td',0,left(x)),h('td',0,sl(x))))))]
+   o.map(x=>h('div',{class:'pcard'},
+    h('div',{class:'phead'},h('b',{style:'font-size:15px'},x.legs?('Parlay · '+x.legs.length+' legs'+(x.future?' · upcoming games':'')):'Single bet'),
+     h('div',{class:'pstats'},mini('Qty','×'+x.count),mini('Bought at',x.price+'¢'),mini('Pays if all win',usd(x.count*100)),mini('Value now',usd(x.value??x.count*x.price)),mini('P&L',sgn(x.unreal||0),cls(x.unreal||0)),mini('Closes in',left(x)),mini('Stop-loss at',sl(x)))),
+    legCard(x)))]
   :h('div',{class:'mut'},S.running?'No open bets yet. The bot is watching for a qualifying market.':'No open bets. Press Start bot to begin.'));
 }
 function report(){
