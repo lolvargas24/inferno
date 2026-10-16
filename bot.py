@@ -42,7 +42,7 @@ DEFAULTS = {"use_demo": True, "dry_run": True, "api_key_id": "",
             "bet_style": "parlay", "parlay_legs": 3, "leg_min_prob": 90.0, "parlay_min_prob": 80.0,
             "update_url": "", "future_parlays": True, "future_hours": 24.0,
             "future_leg_min": 75.0, "future_parlay_min": 50.0}
-VERSION = "5.0"
+VERSION = "5.1"
 
 # Kalshi series ticker -> (ESPN scoreboard path, league name)
 SERIES = {
@@ -400,6 +400,7 @@ def live_games(path):
                 "gid": ev.get("id"), "total": sum(scores),
                 "abbr": str(c["team"].get("abbreviation", "")).lower(),
                 "tid": c["team"].get("id"), "home": (c.get("homeAway") == "home") if c.get("homeAway") else None,
+                "book": book_for(ev["competitions"][0], c),
                 "keys": sorted({k.lower() for k in (c["team"].get("displayName"), c["team"].get("shortDisplayName"),
                                                     c["team"].get("name")) if k}),
             }
@@ -533,7 +534,8 @@ def soccer_games(path):
                         "clock": st.get("displayClock", ""), "minute": _clock_min(st),
                         "lead": scores[i] - scores[1 - i], "label": ev.get("shortName", ""),
                         "total": sum(scores), "start": _start_ts(ev), "tid": t.get("id"),
-                        "home": (c.get("homeAway") == "home") if c.get("homeAway") else None})
+                        "home": (c.get("homeAway") == "home") if c.get("homeAway") else None,
+                        "book": book_for(ev["competitions"][0], c)})
     return out
 
 
@@ -930,7 +932,8 @@ def team_form(path, league, tid):
         if rows:
             gf, ga = sum(x[1] for x in rows) / len(rows), sum(x[2] for x in rows) / len(rows)
             if _sane(league, gf) and _sane(league, ga):
-                data = {"n": len(rows), "gf": gf, "ga": ga}
+                lt = _t(rows[-1][0])
+                data = {"n": len(rows), "gf": gf, "ga": ga, "last": lt.timestamp() if lt else None}
     except Exception as e:
         warn_once(f"recent games for {path}: {e}")
     FORM[key] = {"ts": time.time(), "data": data}
@@ -1031,6 +1034,138 @@ def event_prob(league, spec, A, B, sA, sB):
             return 0.999
         return max(0.0, min(0.995, 1 - phi((line - (T + (muA + muB) * f)) / (SD_TOTAL[league] * math.sqrt(f)))))
     return None
+
+
+INJ = {}                  # espn path -> {"ts", "data": {team id: players out/doubtful}}
+
+
+def _ml(v):
+    """American moneyline (-150, '+130', 'EVEN') -> implied probability, or None."""
+    if isinstance(v, dict):
+        v = v.get("odds", v.get("value"))
+    if isinstance(v, str):
+        v = v.strip().upper().replace("−", "-")
+        if v in ("EVEN", "EV", "PK"):
+            return 0.5
+    x = _num(v)
+    if x is None or x == 0:
+        return None
+    return 100 / (x + 100) if x > 0 else -x / (-x + 100)
+
+
+def parse_book(comp):
+    """Sportsbook numbers ESPN shows for a game (tolerant): de-vigged win chances, total line, spread."""
+    od = (comp.get("odds") or [None])[0] if isinstance(comp.get("odds"), list) else None
+    if not isinstance(od, dict):
+        return {}
+
+    def side(old, new):
+        h = od.get(old)
+        v = h.get("moneyLine") if isinstance(h, dict) else None
+        if v is None and isinstance(od.get("moneyline"), dict):
+            v = (((od["moneyline"].get(new) or {}).get("close")) or {}).get("odds")
+        return _ml(v), (h.get("favorite") if isinstance(h, dict) else None)
+
+    (ph, fh), (pa, fa) = side("homeTeamOdds", "home"), side("awayTeamOdds", "away")
+    draw = None
+    if isinstance(od.get("moneyline"), dict):
+        draw = _ml((((od["moneyline"].get("draw") or {}).get("close")) or {}).get("odds"))
+    draw = draw or _ml((od.get("drawOdds") or {}).get("moneyLine") if isinstance(od.get("drawOdds"), dict) else None)
+    out = {}
+    if ph and pa:
+        tot = ph + pa + (draw or 0)
+        out["home"], out["away"] = ph / tot, pa / tot
+    ou = _num(od.get("overUnder"))
+    if ou:
+        out["ou"] = ou
+    sp = _num(od.get("spread"))
+    if sp is not None and fh is not None and fa is not None and fh != fa:
+        out["spread_home"] = -abs(sp) if fh else abs(sp)
+    return out
+
+
+def book_for(comp, c):
+    """The book numbers from one team's point of view."""
+    bk, ha = parse_book(comp), c.get("homeAway")
+    if not bk or ha not in ("home", "away"):
+        return {}
+    sp = bk.get("spread_home")
+    return {"p_win": bk.get(ha), "ou": bk.get("ou"),
+            "spread": (sp if ha == "home" else -sp) if sp is not None else None}
+
+
+def book_prob(league, spec, A, B):
+    """Chance of the YES side according to the sportsbook line ESPN shows (pre-game only), or None."""
+    if A.get("state") != "pre" or spec.get("half", "FT") != "FT":
+        return None
+    T = (A, B)[spec.get("team", 0)]
+    bt, b0, kind = T.get("book") or {}, A.get("book") or {}, spec["kind"]
+    if kind == "win":
+        return bt.get("p_win")
+    ou = b0.get("ou")
+    if kind == "total" and ou:
+        if league == "SOCCER" and 1.0 <= ou <= 5.0:
+            return max(0.0, min(0.995, 1 - sum(_pois(k, ou) for k in range(int(math.floor(spec["line"])) + 1))))
+        lo, hi = RANGE.get(league, (0, 1e9))
+        if league in SD_TOTAL and 1.4 * lo <= ou <= 2.6 * hi:
+            return max(0.0, min(0.995, 1 - phi((spec["line"] - ou) / SD_TOTAL[league])))
+    if kind == "spread" and league in SD_MARGIN and bt.get("spread") is not None and abs(bt["spread"]) < 40:
+        return max(0.0, min(0.995, 1 - phi((spec["line"] + bt["spread"]) / SD_MARGIN[league])))
+    return None
+
+
+def injuries(path):
+    """Players listed Out/Doubtful per team (ESPN injury report), or None when unavailable."""
+    if not path or path.endswith("/all"):
+        return None
+    ent = INJ.get(path)
+    if ent and time.time() - ent["ts"] < (3600 if ent["data"] else 900):
+        return ent["data"]
+    data = None
+    try:
+        r = requests.get(f"https://site.api.espn.com/apis/site/v2/sports/{path}/injuries", timeout=8).json()
+        d = {}
+        for t in r.get("injuries", []):
+            tid = str((t.get("team") or {}).get("id") or t.get("id") or "")
+            if tid:
+                d[tid] = sum(1 for i in t.get("injuries", [])
+                             if any(w in str(i.get("status", "")).lower() for w in ("out", "doubtful")))
+        data = d or None
+    except Exception as e:
+        warn_once(f"injury report for {path}: {e}")
+    INJ[path] = {"ts": time.time(), "data": data}
+    return data
+
+
+def rest_days(path, league, g):
+    """Days between the team's last finished game and this one (from its schedule)."""
+    f = team_form(path, league, g.get("tid"))
+    if not f or not f.get("last") or not g.get("start"):
+        return None
+    return (g["start"] - f["last"]) / 86400
+
+
+def side_checks(a, side):
+    """Extra research on the team a leg backs: injuries and rest. Returns (veto reason or None, notes)."""
+    pair, ti, path, lg = a.get("pair"), a.get("ti", 0), a.get("path"), a.get("lg")
+    if not pair or a.get("kind") not in ("win", "spread"):
+        return None, []
+    backed, other = (pair[ti], pair[1 - ti]) if side == "YES" else (pair[1 - ti], pair[ti])
+    veto, notes = None, []
+    inj = injuries(path)
+    if inj is not None and backed.get("tid") is not None and other.get("tid") is not None:
+        nb, no = inj.get(str(backed["tid"]), 0), inj.get(str(other["tid"]), 0)
+        notes.append(f"injuries out: {nb} vs {no}")
+        if nb >= 3 and nb >= no + 3:
+            veto = f"the team it backs has {nb} players out (other side {no})"
+    if a.get("pregame"):
+        rb, ro = rest_days(path, lg, backed), rest_days(path, lg, other)
+        if rb is not None and ro is not None:
+            notes.append(f"rest days: {rb:.0f} vs {ro:.0f}")
+            tired = (rb < 3.5 and ro >= 6) if lg == "SOCCER" else (rb < 1.5 and ro >= 2.5 and lg in ("NBA", "NHL", "WNBA", "NCAAMB", "NCAAWB"))
+            if tired and not veto:
+                veto = f"the team it backs is on short rest ({rb:.0f} days vs {ro:.0f})"
+    return veto, notes
 
 
 def _team_index(pair, phrase):
@@ -1137,6 +1272,11 @@ def assess_model(league, m, games, series, path):
     if p is None:
         return {**base, "ok": False, "why": "model has no estimate (unknown teams, overtime or unclear game state)",
                 "model": None, "p": None}
+    pm = p
+    pb = book_prob(league, spec, pair[0], pair[1])
+    if pb is not None:
+        p = (pm + pb) / 2
+    base.update({"p_model": pm, "pb": pb, "pair": (pair[0], pair[1]), "ti": spec.get("team", 0), "path": path, "lg": league})
     ok, why = True, f"model {p:.0%} for: {what}"
     if p * 100 < CFG["leg_min_prob"]:
         ok, why = False, f"model {p:.0%} is under your {CFG['leg_min_prob']:g}% 'obvious' level ({what})"
@@ -1174,7 +1314,7 @@ def assess(league, m, games, spots, series):
     else:
         ok, why = verify(league, game)
     live = bool(game and game["state"] == "in")
-    p, rs, ro = None, None, None
+    p, rs, ro, pm, pb, opp = None, None, None, None, None, None
     if game is not None and league != "TENNIS":
         try:
             pool = list(games.values()) if isinstance(games, dict) else games
@@ -1185,13 +1325,20 @@ def assess(league, m, games, spots, series):
                                team_strength(path, league, game), team_strength(path, league, opp))
             if p is None:
                 p = win_prob(league, game, rs, ro)
+            if p is not None and opp is not None:
+                pm = p
+                pb = book_prob(league, {"kind": "win", "team": 0, "line": 0.0, "half": "FT"}, game, opp)
+                if pb is not None:
+                    p = (pm + pb) / 2
         except Exception as e:
             warn_once(f"win model failed: {e}")
     return {"ok": ok, "why": why, "model": round(p * 100) if p is not None else None, "p": p, "live": live,
             "behind": bool(live and game["lead"] < 0), "info": game_info(league, game),
             "gid": f"{league}:{game['gid']}" if game is not None else m.get("event_ticker"),
             "pregame": bool(game and game["state"] == "pre"), "start": game.get("start") if game else None,
-            "rs": rs, "ro": ro, "is_total": False, "kind": "win" if p is not None else None}
+            "rs": rs, "ro": ro, "is_total": False, "kind": "win" if p is not None else None,
+            "p_model": pm if pm is not None else p, "pb": pb, "pair": (game, opp) if opp is not None else None,
+            "ti": 0, "path": path, "lg": league}
 
 
 def rate(ask, a):
@@ -1479,7 +1626,7 @@ def place_parlay(legs, price, count, comb):
                        "future": any(x.get("future") for x in legs),
                        "legs": [{"ticker": x["ticker"], "name": x["name"], "league": x["league"], "gid": x["gid"],
                                  "title": x.get("title", ""), "outcome": x.get("outcome") or x["name"], "start": x.get("start"),
-                                 "side": x.get("side", "YES"), "ask": x["ask"], "p": round(x["p"], 3), "bid": x["bid"], "result": None} for x in legs],
+                                 "side": x.get("side", "YES"), "notes": x.get("notes", []), "ask": x["ask"], "p": round(x["p"], 3), "bid": x["bid"], "result": None} for x in legs],
                        "status": "HOLDING", "pnl": None, "closed_ts": None, "bid": None})
         _save(ORDERS_FILE, ORDERS)
     why = "; ".join(f"{x['league']} {'NO on ' if x.get('side') == 'NO' else ''}{x['name']} {x['ask']}\u00a2 ({x['why']})" for x in legs)
@@ -1617,20 +1764,37 @@ def tick():
             nask = 100 - bid if nask is None and bid is not None else nask
             nbid = 100 - ask if nbid is None and ask is not None else nbid
             opts = []
+            pm0, pb0 = a.get("p_model", a["p"]), a.get("pb")
+            why_not = None
             for side, p_, ak, bd in (("YES", a["p"], ask, bid), ("NO", 1 - a["p"], nask, nbid)):
                 p_ = min(p_, 0.97 if pre else 0.995)
-                if (p_ >= thr and ak is not None and bd is not None and 50 <= ak <= 98 and ak <= p_ * 100 + 3
+                if not (p_ >= thr and ak is not None and bd is not None and 50 <= ak <= 98 and ak <= p_ * 100 + 3
                         and ak - bd <= 8 and strong_pick(a, side)):
-                    opts.append((p_, side, ak, bd))
+                    continue
+                pm_s, pb_s = (pm0, pb0) if side == "YES" else (1 - pm0, None if pb0 is None else 1 - pb0)
+                if pb_s is not None and (pb_s < thr - 0.05 or abs(pm_s - pb_s) > 0.15):
+                    why_not = "disagree"        # the sportsbook line does not back the bot's own estimate
+                    continue
+                veto, notes = side_checks(a, side)
+                if veto:
+                    why_not = veto
+                    continue
+                notes = [f"bot model {pm_s:.0%}"] + ([f"sportsbook {pb_s:.0%}"] if pb_s is not None else []) + notes
+                opts.append((p_, side, ak, bd, notes))
+            if not opts and why_not:
+                r_ = reasons.setdefault("research " + ("disagree" if why_not == "disagree" else "veto"),
+                                        [0, "legs dropped after extra research (sportsbook line disagrees, injuries or short rest)"])
+                r_[0] += 1
+                return
             if not opts:
                 r_ = reasons.setdefault("bar", [0, "game markets that did not clear your bar (not likely enough, priced too high, or too little data on the teams)"])
                 r_[0] += 1
                 return
-            p_, side, ak, bd = max(opts)
+            p_, side, ak, bd, notes = max(opts, key=lambda o: o[0])
             f["passed"] += 1
             pool.append({"ticker": t, "name": name, "league": league, "side": side, "ask": ak, "bid": bd, "p": p_,
                          "gid": a.get("gid") or t, "why": f"{a['kind']} model {p_:.0%}", "future": pre,
-                         "start": a.get("start"), "title": m.get("title", ""),
+                         "start": a.get("start"), "title": m.get("title", ""), "notes": notes,
                          "outcome": m.get("yes_sub_title") or name,
                          "close_ts": (time.time() + mins * 60) if mins is not None else None})
             return
@@ -1908,7 +2072,7 @@ function legCard(o){
  const starts=x=>x.start&&x.start*1000>Date.now()?' · starts in '+closes(Math.round((x.start*1000-Date.now())/60000)):'';
  return Object.entries(groups).map(([lg,ls])=>[h('div',{class:'grp'},(LN[lg]||lg)),
   ls.map(l=>[h('div',{class:'lt'},l.title||l.name),h('div',{class:'lo'},h('span',0,(l.side==='NO'?'No · ':'')+(l.outcome||l.name)+starts(l)),
-   h('span',{class:l.result?(l.result===(l.side||'YES').toLowerCase()?'pos':'neg'):''},l.result?(l.result===(l.side||'YES').toLowerCase()?'Won':'Lost'):(Math.round(l.bid!=null&&l.bid>0?l.bid:l.ask)+'%')))])]);
+   h('span',{class:l.result?(l.result===(l.side||'YES').toLowerCase()?'pos':'neg'):''},l.result?(l.result===(l.side||'YES').toLowerCase()?'Won':'Lost'):(Math.round(l.bid!=null&&l.bid>0?l.bid:l.ask)+'%'))),(l.notes&&l.notes.length)?h('div',{class:'mut',style:'font-size:12px;margin:0 0 4px 24px'},'Checked: '+l.notes.join(' · ')):null])]);
 }
 function position(mode){
  const o=S.orders.filter(x=>x.mode===mode&&x.status==='HOLDING').sort((a,b)=>b.ts-a.ts);
